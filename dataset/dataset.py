@@ -1,275 +1,258 @@
-'''
-djlfsjlfkdj
-'''
+"""Dataset classes for anti-spoofing training and evaluation.
+
+Provides:
+- CNSpoofDataset: Standard dataset for evaluation (individual samples).
+- MetaDataset: Meta-learning dataset (meta-train/meta-test splits per batch).
+"""
+
 import os
-import torch
-import numpy as np
 import random
+from typing import Dict, List, Tuple
+
+import numpy as np
 import soundfile as sf
-from torch.utils.data import Dataset, DataLoader
+import torch
+from torch.utils.data import Dataset
+
+# Genre to index mapping (consistent across all datasets)
+GENRE_TO_IDX = {
+    'drama': 0, 'entertainment': 1, 'interview': 2,
+    'live_broadcast': 3, 'movie': 4, 'play': 5,
+    'recitation': 6, 'singing': 7, 'speech': 8, 'vlog': 9,
+}
+
+LABEL_TO_IDX = {'real': 1, 'spoof': 0}
+
+
+def read_kaldi_file(path: str) -> Dict[str, str]:
+    """Read a Kaldi-format file (space-separated key-value pairs).
+
+    Args:
+        path: Path to the Kaldi file.
+
+    Returns:
+        Dictionary mapping utterance IDs to values.
+    """
+    mapping = {}
+    with open(path, 'r') as f:
+        for line in f:
+            uttid, content = line.strip().split(maxsplit=1)
+            mapping[uttid] = content
+    return mapping
+
+
+class AudioCollator:
+    """Handles padding/truncation of variable-length audio batches.
+
+    Args:
+        sampling_rate: Audio sampling rate in Hz.
+        max_len_sec: Maximum audio length in seconds.
+        padding_value: Value used for padding shorter sequences.
+    """
+
+    def __init__(self, sampling_rate: int = 16000, max_len_sec: int = 20,
+                 padding_value: float = 0.0):
+        self.sampling_rate = sampling_rate
+        self.max_len_sec = max_len_sec
+        self.max_len_samples = sampling_rate * max_len_sec
+        self.padding_value = padding_value
+
+    def pad_or_truncate(self, batch: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Pad shorter sequences and randomly truncate longer ones."""
+        trailing_dims = batch[0].size()[1:]
+        max_len = min(
+            max(s.size(0) for s in batch),
+            self.max_len_samples,
+        )
+
+        if all(x.shape[0] == max_len for x in batch):
+            return batch
+
+        output = []
+        for tensor in batch:
+            out = tensor.new_full((max_len,) + trailing_dims, self.padding_value)
+            if tensor.size(0) <= max_len:
+                out[:tensor.size(0), ...] = tensor
+            else:
+                start = torch.randint(0, tensor.size(0) - max_len, (1,)).item()
+                out[...] = tensor[start:start + max_len, ...]
+            output.append(out)
+        return output
+
+    def get_effective_length(self, length: int) -> int:
+        """Clamp audio length to maximum allowed samples."""
+        return min(length, self.max_len_samples)
+
 
 class CNSpoofDataset(Dataset):
-    def __init__(self, task, data = 'train'):
-        self.utt2wav = {}
-        self.utt2label = {}
-        self.utt2genre = {}
-        self.utt2idx = {}
-        self.idx2utt = {}
-        self.dur = []
-        self.utt2wav = self._read_kaldi_file(os.path.join('data', task, data, 'wav.scp'))
-        self.utt2label = self._read_kaldi_file(os.path.join('data', task, data, 'utt2spk'))
-        self.utt2genre = self._read_kaldi_file(os.path.join('data', task, data, 'utt2genre'))
-        self.utt2idx = dict([(utt, idx) for idx, utt in enumerate(list(self.utt2label.keys()))])
-        self.idx2utt = dict([(idx, utt) for idx, utt in enumerate(list(self.utt2label.keys()))])
-        utt2dur = self._read_kaldi_file(os.path.join('data', task, data, 'utt2dur'))
-        self.dur = list(utt2dur.values())
-        self.label2idx = {'real': 1, 'spoof': 0}
-        self.genre2idx = {
-                'drama':0,
-                'entertainment':1,
-                'interview':2,
-                'live_broadcast':3,
-                'movie':4,
-                'play':5,
-                'recitation':6,
-                'singing':7,
-                'speech':8,
-				'vlog':9
-                }
+    """Standard anti-spoofing dataset for evaluation.
 
-    def _read_kaldi_file(self, path):
-        utt2content = {}
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.rstrip()
-                uttid, content = line.split()
-                utt2content[uttid] = content
-        return utt2content
+    Returns individual (audio, label, genre, genre_id, length) tuples.
 
-    def __len__(self):
-        return len(self.utt2label)
+    Args:
+        task: Task name (used to locate data directory).
+        split: Data split ('train', 'val', or 'test').
+    """
 
-    def __getitem__(self, idx):
-        uttid = self.idx2utt[idx]
+    def __init__(self, task: str, split: str = 'train'):
+        data_dir = os.path.join('data', task, split)
+
+        self.utt2wav = read_kaldi_file(os.path.join(data_dir, 'wav.scp'))
+        self.utt2label = read_kaldi_file(os.path.join(data_dir, 'utt2spk'))
+        self.utt2genre = read_kaldi_file(os.path.join(data_dir, 'utt2genre'))
+
+        self.utterances = list(self.utt2label.keys())
+
+    def __len__(self) -> int:
+        return len(self.utterances)
+
+    def __getitem__(self, idx: int):
+        uttid = self.utterances[idx]
         data, _ = sf.read(self.utt2wav[uttid])
         audio = torch.from_numpy(data.astype(np.float32)).unsqueeze(1)
-        label = self.label2idx[self.utt2label[uttid]]
+        label = LABEL_TO_IDX[self.utt2label[uttid]]
         genre = self.utt2genre[uttid]
-        genreid = self.genre2idx[genre]
-        return audio, label, genre, genreid, len(data)
+        genre_id = GENRE_TO_IDX[genre]
+        return audio, label, genre, genre_id, len(data)
+
 
 class MetaDataset(Dataset):
-    '''
-    ssjdkfjlsf
-    '''
-    def __init__(self, task, data = 'train'):
-        self.utt2wav = {}
-        self.utt2label = {}
-        self.utt2genre = {}
-        self.genre2uttlist = {}
-        self.utt2idx = {}
-        self.idx2utt = {}
-        self.dur = []
-        self.utt2wav = self._read_kaldi_file(os.path.join('data', task, data, 'wav.scp'))
-        self.utt2label = self._read_kaldi_file(os.path.join('data', task, data, 'utt2spk'))
-        self.utt2genre = self._read_kaldi_file(os.path.join('data', task, data, 'utt2genre'))
-        self.utt2idx = dict([(utt, idx) for idx, utt in enumerate(list(self.utt2label.keys()))])
-        self.idx2utt = dict([(idx, utt) for idx, utt in enumerate(list(self.utt2label.keys()))])
-        utt2dur = self._read_kaldi_file(os.path.join('data', task, data, 'utt2dur'))
-        self.dur = list(utt2dur.values())
-        self.label2idx = {'real': 1, 'spoof': 0}
-        self.genres = list(set(self.utt2genre.values()))
+    """Meta-learning dataset with genre-based meta-train/meta-test splits.
+
+    Each batch is split by genre: most genres go to meta-train,
+    one held-out genre goes to meta-test. This encourages learning
+    domain-invariant features.
+
+    Args:
+        task: Task name (used to locate data directory).
+        split: Data split ('train', 'val', or 'test').
+    """
+
+    def __init__(self, task: str, split: str = 'train'):
+        data_dir = os.path.join('data', task, split)
+
+        self.utt2wav = read_kaldi_file(os.path.join(data_dir, 'wav.scp'))
+        self.utt2label = read_kaldi_file(os.path.join(data_dir, 'utt2spk'))
+        self.utt2genre = read_kaldi_file(os.path.join(data_dir, 'utt2genre'))
+
+        self.utterances = list(self.utt2label.keys())
+        self.genres = sorted(set(self.utt2genre.values()))
+        self.genre2idx = {g: i for i, g in enumerate(self.genres)}
+
+        # Build genre → utterance list mapping
+        self.genre2uttlist: Dict[str, List[str]] = {}
         for uttid, genre in self.utt2genre.items():
-            if not genre in self.genre2uttlist:
-                self.genre2uttlist[genre] = []
-            self.genre2uttlist[genre].append(uttid)
-        self.collate = Collate()
-        genres = list(set(self.utt2genre.values()))
-        self.genre2idx = {}
-        for idx, genre in enumerate(genres):
-            self.genre2idx[genre] = idx
+            self.genre2uttlist.setdefault(genre, []).append(uttid)
 
-    def _read_kaldi_file(self, path):
-        utt2content = {}
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.rstrip()
-                uttid, content = line.split()
-                utt2content[uttid] = content
-        return utt2content
+        self.collator = AudioCollator()
 
-    def __len__(self):
-        return len(self.utt2label)
+    def __len__(self) -> int:
+        return len(self.utterances)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
+        # Returns index only; actual data loading happens in collate_fn
         return idx
 
-    def get_domain_num(self):
-        return len(set(self.utt2genre.values()))
+    @property
+    def domain_num(self) -> int:
+        """Number of unique genres/domains."""
+        return len(self.genres)
 
-    def random_collate_fn(self, batch):
-        batch = [self.idx2utt[idx] for idx in batch]
-        num_meta_test_samples = 0
-        while num_meta_test_samples < 2:
-            selected_genres_list = [self.utt2genre[uttid] for uttid in batch]
-            selected_genres = list(set(selected_genres_list))
-            assert len(selected_genres) >= 2, "In this batch there is only one genre!"
-            meta_train_genres = random.sample(selected_genres, k = len(selected_genres) - 1)
-            meta_test_genres = []
-            for genre in selected_genres:
-                if not genre in meta_train_genres:
-                    meta_test_genres.append(genre)
-            meta_train_uttid = []
-            meta_test_uttid = []
-            for uttid in batch:
-                if self.utt2genre[uttid] in meta_train_genres:
-                    meta_train_uttid.append(uttid)
-                else:
-                    meta_test_uttid.append(uttid)
-            num_meta_test_samples = len(meta_test_uttid)
-        meta_train_audio = [torch.from_numpy(sf.read(self.utt2wav[uttid])[0].astype(np.float32)).unsqueeze(1) for uttid in meta_train_uttid]
-        meta_test_audio = [torch.from_numpy(sf.read(self.utt2wav[uttid])[0].astype(np.float32)).unsqueeze(1) for uttid in meta_test_uttid]
-        meta_train_label = torch.tensor([self.label2idx[self.utt2label[uttid]] for uttid in meta_train_uttid], dtype = torch.float32)
-        meta_test_label = torch.tensor([self.label2idx[self.utt2label[uttid]] for uttid in meta_test_uttid], dtype = torch.float32)
-        meta_train_length = [len(audio) for audio in meta_train_audio]
-        meta_test_length = [len(audio) for audio in meta_test_audio]
-        meta_train_datalengths = [min(train_length, self.collate.sampling_rate * self.collate.max_len) for train_length in meta_train_length]
-        meta_test_datalengths = [min(test_length, self.collate.sampling_rate * self.collate.max_len) for test_length in meta_test_length]
-        meta_train_genresid = torch.tensor([self.genre2idx[self.utt2genre[uttid]] for uttid in meta_train_uttid], dtype = torch.int64)
-        meta_test_genresid = torch.tensor([self.genre2idx[self.utt2genre[uttid]] for uttid in meta_test_uttid], dtype = torch.int64)
-        if self.collate.mode == 'trunc':
-            meta_train_audio = self.collate._trunc(meta_train_audio)
-            meta_test_audio = self.collate._trunc(meta_test_audio)
-        else:
-            meta_train_audio = self.collate._padding(meta_train_audio)
-            meta_test_audio = self.collate._padding(meta_test_audio)
-        meta_train_audio = torch.concat(meta_train_audio, dim = 1).permute(1, 0).view(len(meta_train_audio), -1, 1)
-        meta_test_audio = torch.concat(meta_test_audio, dim = 1).permute(1, 0).view(len(meta_test_audio), -1, 1)
-        return meta_train_audio, meta_train_label, meta_train_datalengths, meta_train_genresid, meta_test_audio, meta_test_label, meta_test_datalengths, meta_test_genresid #genres, genreids, datalengths   
+    def _load_audio_batch(self, uttids: List[str]) -> Tuple[
+        List[torch.Tensor], torch.Tensor, List[int], torch.Tensor
+    ]:
+        """Load audio, labels, lengths, and genre IDs for utterances.
 
-    def balance_collate_fn(self, batch):
+        Returns:
+            audios: List of audio tensors.
+            labels: Tensor of binary labels.
+            lengths: List of effective audio lengths.
+            genre_ids: Tensor of genre indices.
+        """
+        audios = [
+            torch.from_numpy(sf.read(self.utt2wav[u])[0].astype(np.float32)).unsqueeze(1)
+            for u in uttids
+        ]
+        labels = torch.tensor(
+            [LABEL_TO_IDX[self.utt2label[u]] for u in uttids],
+            dtype=torch.float32,
+        )
+        lengths = [self.collator.get_effective_length(len(a)) for a in audios]
+        genre_ids = torch.tensor(
+            [self.genre2idx[self.utt2genre[u]] for u in uttids],
+            dtype=torch.int64,
+        )
+        return audios, labels, lengths, genre_ids
+
+    def _collate_audios(self, audios: List[torch.Tensor]) -> torch.Tensor:
+        """Pad/truncate and stack audio tensors into a batch.
+
+        Returns:
+            Batch tensor of shape (num_samples, max_len, 1).
+        """
+        padded = self.collator.pad_or_truncate(audios)
+        return (torch.cat(padded, dim=1)
+                .permute(1, 0)
+                .view(len(padded), -1, 1))
+
+    def random_collate_fn(self, batch: List[int]):
+        """Collate: randomly split batch genres into meta-train/meta-test.
+
+        Randomly selects one genre as meta-test; all others are meta-train.
+        Retries if meta-test has fewer than 2 samples.
+
+        Returns:
+            Tuple of (mtr_audio, mtr_labels, mtr_lengths, mtr_genre_ids,
+                      mte_audio, mte_labels, mte_lengths, mte_genre_ids).
+        """
+        uttids = [self.utterances[idx] for idx in batch]
+
+        # Retry until meta-test has at least 2 samples
+        mtr_uttids: List[str] = []
+        mte_uttids: List[str] = []
+        while len(mte_uttids) < 2:
+            batch_genres = list({self.utt2genre[u] for u in uttids})
+            assert len(batch_genres) >= 2, "Batch contains only one genre!"
+
+            mtr_genre_set = set(random.sample(batch_genres, k=len(batch_genres) - 1))
+            mtr_uttids = [u for u in uttids if self.utt2genre[u] in mtr_genre_set]
+            mte_uttids = [u for u in uttids if self.utt2genre[u] not in mtr_genre_set]
+
+        mtr_audios, mtr_labels, mtr_lengths, mtr_gids = self._load_audio_batch(mtr_uttids)
+        mte_audios, mte_labels, mte_lengths, mte_gids = self._load_audio_batch(mte_uttids)
+
+        return (
+            self._collate_audios(mtr_audios), mtr_labels, mtr_lengths, mtr_gids,
+            self._collate_audios(mte_audios), mte_labels, mte_lengths, mte_gids,
+        )
+
+    def balance_collate_fn(self, batch: List[int]):
+        """Collate: balanced genre sampling for meta-train/meta-test.
+
+        Samples equal numbers per genre. One genre is held out for meta-test.
+
+        Returns:
+            Same tuple format as random_collate_fn.
+        """
         batch_size = len(batch)
         num_per_genre = batch_size // len(self.genres)
-        meta_train_genres = random.sample(self.genres, k = len(self.genres) - 1)
-        meta_test_genres = []
-        for genre in self.genres:
-            if not genre in meta_train_genres:
-                meta_test_genres.append(genre)
-        meta_train_uttid_genre = [random.sample(self.genre2uttlist[genre], k = num_per_genre) for genre in meta_train_genres]
-        meta_test_uttid_genre = [random.sample(self.genre2uttlist[genre], k = num_per_genre) for genre in meta_test_genres]
-        meta_train_uttid, meta_test_uttid = [], []
-        for uttidlist in meta_train_uttid_genre:
-            meta_train_uttid += uttidlist
-        for uttidlist in meta_test_uttid_genre:
-            meta_test_uttid += uttidlist
-        meta_train_audio = [torch.from_numpy(sf.read(self.utt2wav[uttid])[0].astype(np.float32)).unsqueeze(1) for uttid in meta_train_uttid]
-        meta_test_audio = [torch.from_numpy(sf.read(self.utt2wav[uttid])[0].astype(np.float32)).unsqueeze(1) for uttid in meta_test_uttid]
-        meta_train_label = torch.tensor([self.label2idx[self.utt2label[uttid]] for uttid in meta_train_uttid], dtype = torch.float32)
-        meta_test_label = torch.tensor([self.label2idx[self.utt2label[uttid]] for uttid in meta_test_uttid], dtype = torch.float32)
-        meta_train_length = [len(audio) for audio in meta_train_audio]
-        meta_test_length = [len(audio) for audio in meta_test_audio]
-        meta_train_datalengths = [min(train_length, self.collate.sampling_rate * self.collate.max_len) for train_length in meta_train_length]
-        meta_test_datalengths = [min(test_length, self.collate.sampling_rate * self.collate.max_len) for test_length in meta_test_length]
-        if self.collate.mode == 'trunc':
-            meta_train_audio = self.collate._trunc(meta_train_audio)
-            meta_test_audio = self.collate._trunc(meta_test_audio)
-        else:
-            meta_train_audio = self.collate._padding(meta_train_audio)
-            meta_test_audio = self.collate._padding(meta_test_audio)
-        meta_train_audio = torch.concat(meta_train_audio, dim = 1).permute(1, 0).view(len(meta_train_audio), -1, 1)
-        meta_test_audio = torch.concat(meta_test_audio, dim = 1).permute(1, 0).view(len(meta_test_audio), -1, 1)
-        return meta_train_audio, meta_train_label, meta_train_datalengths, meta_test_audio, meta_test_label, meta_test_datalengths #genres, genreids, datalengths
 
-class Collate(object):
-    def __init__(
-            self,
-            mode = 'padding',
-            sampling_rate = 16000,
-            max_len = 20,
-            padding_value = 0.0
-            ):
-        self.mode = mode
-        self.max_len = max_len
-        self.padding_value = padding_value
-        self.sampling_rate = sampling_rate
+        mtr_genre_names = random.sample(self.genres, k=len(self.genres) - 1)
+        mte_genre_names = [g for g in self.genres if g not in mtr_genre_names]
 
-    def _trunc(self, batch):
-        dim_size = batch[0].size()
-        trailing_dims = dim_size[1:]
+        mtr_uttids = [
+            u for genre in mtr_genre_names
+            for u in random.sample(self.genre2uttlist[genre], k=num_per_genre)
+        ]
+        mte_uttids = [
+            u for genre in mte_genre_names
+            for u in random.sample(self.genre2uttlist[genre], k=num_per_genre)
+        ]
 
-        # get the maximum length
-        max_len = max([s.size(0) for s in batch])
-        
-        if all(x.shape[0] == max_len for x in batch):
-            # if all data sequences in batch have the same length, no need to pad
-            return batch
-        else:
-            # else, we need to pad 
-            out_dims = (max_len, ) + trailing_dims
-            
-            output_batch = []
-            for i, tensor in enumerate(batch):
-                # check the rest of dimensions
-                if tensor.size()[1:] != trailing_dims:
-                    print("Data in batch has different dimensions:")
-                    for data in batch:
-                        print(str(data.size()))
-                    raise RuntimeError('Fail to create batch data')
-                # save padded results
-                out_tensor = tensor.new_full(out_dims, self.padding_value)
-                out_tensor[:tensor.size(0), ...] = tensor
-                output_batch.append(out_tensor)
-            return output_batch
+        mtr_audios, mtr_labels, mtr_lengths, mtr_gids = self._load_audio_batch(mtr_uttids)
+        mte_audios, mte_labels, mte_lengths, mte_gids = self._load_audio_batch(mte_uttids)
 
-    def _padding(self, batch):
-        dim_size = batch[0].size()
-        trailing_dims = dim_size[1:]
-
-        # get the maximum length, if length > 20s, truncate the audio
-        max_len = min(max([s.size(0) for s in batch]), self.max_len * self.sampling_rate)
-        #  max_len = max([s.size(0) for s in batch])
-        
-        if all(x.shape[0] == max_len for x in batch):
-            # if all data sequences in batch have the same length, no need to pad
-            return batch
-        else:
-            # else, we need to pad 
-            out_dims = (max_len, ) + trailing_dims
-            
-            output_batch = []
-            for _, tensor in enumerate(batch):
-                # check the rest of dimensions
-                if tensor.size()[1:] != trailing_dims:
-                    print("Data in batch has different dimensions:")
-                    for data in batch:
-                        print(str(data.size()))
-                    raise RuntimeError('Fail to create batch data')
-                # save padded results
-                out_tensor = tensor.new_full(out_dims, self.padding_value)
-                if tensor.size(0) <= max_len:
-                    out_tensor[:tensor.size(0), ...] = tensor
-                else:
-                    start = torch.randint(0, tensor.size(0) - max_len, (1,))
-                    out_tensor[:, ...] = tensor[start:start+max_len, ...]
-                output_batch.append(out_tensor)
-            return output_batch
-
-if __name__ == "__main__":
-    import sys
-    from tqdm import tqdm
-    meta_dataset = MetaDataset('ordinary', 'train')
-    trainloader = DataLoader(meta_dataset,
-                             batch_size = 300,
-                             shuffle = True,
-                             collate_fn = meta_dataset.random_collate_fn,
-                             num_workers = 8,
-                             pin_memory = True)
-    for mtr_data, mtr_label, mtr_datalength, mtr_genre, mte_data, mte_label, mte_datalength, mte_genre in tqdm(trainloader):
-        print(mtr_data.shape)
-        print(mtr_label)
-        print(mtr_datalength)
-        print(type(mtr_genre))
-        print(mte_data.shape)
-        print(mte_label)
-        print(mte_datalength)
-        print(mte_genre)
+        return (
+            self._collate_audios(mtr_audios), mtr_labels, mtr_lengths, mtr_gids,
+            self._collate_audios(mte_audios), mte_labels, mte_lengths, mte_gids,
+        )

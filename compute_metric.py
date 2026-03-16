@@ -1,33 +1,43 @@
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-from sklearn.metrics import roc_curve
+"""Compute Equal Error Rate (EER) from score files."""
+
 import argparse
+from typing import List, Tuple
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--score-filepath', dest = 'score_filepath', default = '', type = str)
-    return parser.parse_args()
+from scipy.interpolate import interp1d
+from scipy.optimize import brentq
+from sklearn.metrics import roc_curve
 
-def read_score_file(path):
-    y_pred = []
-    y_true = []
+
+def read_score_file(path: str) -> Tuple[List[float], List[float]]:
+    """Read score file with format: <score> <label> <genre> per line."""
+    y_pred, y_true = [], []
     with open(path, 'r') as f:
         for line in f:
-            line = line.rstrip()
-            score, label, genre = line.split(' ')
-            y_pred.append(eval(score))
-            y_true.append(eval(label))
+            score, label, _genre = line.strip().split(' ')
+            y_pred.append(float(score))
+            y_true.append(float(label))
     return y_pred, y_true
 
-def compute_eer(y_true, y_pred):
-    fpr, tpr, threshold = roc_curve(y_true, y_pred, pos_label = 1)
+
+def compute_eer(y_true: List[float], y_pred: List[float]) -> Tuple[float, float]:
+    """Compute Equal Error Rate and corresponding threshold."""
+    fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
     eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-    threshold = interp1d(fpr, threshold)(eer)
+    threshold = float(interp1d(fpr, thresholds)(eer))
     return eer, threshold
 
-if __name__ == '__main__':
-    args = parse_args()
+
+def main():
+    parser = argparse.ArgumentParser(description='Compute EER from score file')
+    parser.add_argument('--score-filepath', dest='score_filepath',
+                        required=True, type=str)
+    args = parser.parse_args()
+
     y_pred, y_true = read_score_file(args.score_filepath)
     eer, threshold = compute_eer(y_true, y_pred)
-    print("EER: {:3.3f}%".format(100 * eer))
-    print("Threshold: {:.4f}".format(threshold))
+    print(f"EER: {100 * eer:.3f}%")
+    print(f"Threshold: {threshold:.4f}")
+
+
+if __name__ == '__main__':
+    main()
